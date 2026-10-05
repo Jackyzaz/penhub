@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# จัดการ PentAGI บน kalla
+#   ./penhub-kalla start   สตาร์ตบริการ + เปิด SSH tunnel + เปิด browser
+#   ./penhub-kalla stop    ปิด SSH tunnel + หยุดบริการบน kalla (ข้อมูลยังอยู่)
+#   ./penhub-kalla status  ดูสถานะบริการ, tunnel และเว็บ (exit 0 = พร้อมใช้งานทั้งหมด)
+# ตั้ง NO_BROWSER=1 ถ้าไม่ต้องการให้ start เปิด browser
+set -euo pipefail
+
+REMOTE="soravit@kalla"
+REMOTE_DIR="/home/soravit/pentagi"
+PROJECT="penhub-pentagi"
+PORT=8443
+NAME="pentagi.local"
+URL="https://${NAME}:${PORT}"
+CA="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pentagi-service-ca.crt"
+SOCK="${XDG_RUNTIME_DIR:-/tmp}/penhub-kalla.sock"
+
+compose() {
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" \
+    "cd ${REMOTE_DIR} && docker compose -p ${PROJECT} -f docker-compose.yml -f docker-compose.local-llm.yml $*"
+}
+
+tunnel_open() { ssh -S "$SOCK" -O check "$REMOTE" >/dev/null 2>&1; }
+
+start() {
+  if ! grep -qE "^127\.0\.0\.1[[:space:]]+${NAME}\b" /etc/hosts; then
+    echo "ไม่พบ ${NAME} ใน /etc/hosts ให้รันก่อน:" >&2
+    echo "  echo '127.0.0.1 ${NAME}' | sudo tee -a /etc/hosts" >&2
+    exit 1
+  fi
+  if [[ ! -f "$CA" ]]; then
+    echo "ไม่พบไฟล์ CA: $CA" >&2
+    exit 1
+  fi
+
+  echo "==> สตาร์ตบริการบน kalla"
+  compose up -d
+
+  echo "==> SSH tunnel พอร์ต ${PORT}"
+  if tunnel_open; then
+    echo "tunnel ของสคริปต์เปิดอยู่แล้ว"
+  elif ss -ltn | grep -q "127.0.0.1:${PORT}\b"; then
+    echo "มีตัวฟังที่พอร์ต ${PORT} อยู่แล้ว (tunnel ที่เปิดเอง) ข้ามขั้นตอนนี้"
+  else
+    ssh -f -N -M -S "$SOCK" -o BatchMode=yes -o ExitOnForwardFailure=yes \
+      -L "${PORT}:127.0.0.1:${PORT}" "$REMOTE"
+    echo "เปิด tunnel ในพื้นหลังแล้ว"
+  fi
+
+  echo "==> รอให้เว็บพร้อม"
+  for _ in $(seq 1 60); do
+    if [[ "$(curl -s -o /dev/null -w '%{http_code}' --cacert "$CA" "$URL" || true)" == "200" ]]; then
+      echo "พร้อมใช้งาน: $URL"
+      if [[ -z "${NO_BROWSER:-}" ]]; then
+        if command -v chromium >/dev/null; then
+          nohup chromium "$URL" >/dev/null 2>&1 &
+        else
+          xdg-open "$URL" >/dev/null 2>&1 &
+        fi
+      fi
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "เว็บยังไม่ตอบ HTTP 200 ภายใน 60 วินาที ลองดู log: ssh ${REMOTE} 'docker logs --tail 50 pentagi'" >&2
+  exit 1
+}
+
+stop() {
+  echo "==> ปิด SSH tunnel"
+  if tunnel_open; then
+    ssh -S "$SOCK" -O exit "$REMOTE" >/dev/null 2>&1
+    echo "ปิด tunnel แล้ว"
+  else
+    echo "ไม่มี tunnel ที่สคริปต์เปิดไว้"
+  fi
+  if ss -ltn | grep -q "127.0.0.1:${PORT}\b"; then
+    echo "หมายเหตุ: พอร์ต ${PORT} ยังมีตัวฟังอยู่ (tunnel ที่เปิดเองใน terminal อื่น) ต้องปิดเอง"
+  fi
+
+  echo "==> หยุดบริการบน kalla"
+  compose stop
+}
+
+status() {
+  local rc=0
+
+  echo "==> บริการบน kalla"
+  if ! compose ps; then
+    echo "เชื่อมต่อ kalla ไม่ได้" >&2
+    rc=1
+  fi
+
+  echo "==> SSH tunnel พอร์ต ${PORT}"
+  if tunnel_open; then
+    echo "เปิดอยู่ (tunnel ของสคริปต์)"
+  elif ss -ltn | grep -q "127.0.0.1:${PORT}\b"; then
+    echo "เปิดอยู่ (tunnel ที่เปิดเอง)"
+  else
+    echo "ปิดอยู่"
+    rc=1
+  fi
+
+  echo "==> เว็บ ${URL}"
+  local code
+  code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' --cacert "$CA" "$URL" || true)"
+  if [[ "$code" == "200" ]]; then
+    echo "ตอบ HTTP 200 พร้อมใช้งาน"
+  else
+    echo "ไม่พร้อม (HTTP ${code:-000})"
+    rc=1
+  fi
+
+  return "$rc"
+}
+
+case "${1:-}" in
+  start)  start ;;
+  stop)   stop ;;
+  status) status ;;
+  *)
+    echo "usage: $(basename "$0") {start|stop|status}" >&2
+    exit 2
+    ;;
+esac
