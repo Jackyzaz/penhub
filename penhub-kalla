@@ -7,7 +7,7 @@
 set -euo pipefail
 
 REMOTE="soravit@kalla"
-REMOTE_DIR="/home/soravit/pentagi"
+REMOTE_DIR="/home/soravit/penhub/src"
 PROJECT="penhub-pentagi"
 PORT=8443
 NAME="pentagi.local"
