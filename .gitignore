@@ -7,3 +7,6 @@ src/.env.*
 src/data/
 src/docker-ssl/
 src/ollama-data/
+
+# CA ของ PentAGI เปลี่ยนทุกครั้งที่ติดตั้งใหม่ ให้ดึงด้วย ./penhub-kalla ca
+pentagi-service-ca.crt

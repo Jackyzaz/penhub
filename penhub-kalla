@@ -3,6 +3,7 @@
 #   ./penhub-kalla start   สตาร์ตบริการ + เปิด SSH tunnel + เปิด browser
 #   ./penhub-kalla stop    ปิด SSH tunnel + หยุดบริการบน kalla (ข้อมูลยังอยู่)
 #   ./penhub-kalla status  ดูสถานะบริการ, tunnel และเว็บ (exit 0 = พร้อมใช้งานทั้งหมด)
+#   ./penhub-kalla ca      ดึง CA ของ PentAGI จาก kalla (ไม่อยู่ใน git; start จะดึงให้เองด้วย)
 # ตั้ง NO_BROWSER=1 ถ้าไม่ต้องการให้ start เปิด browser
 set -euo pipefail
 
@@ -22,19 +23,73 @@ compose() {
 
 tunnel_open() { ssh -S "$SOCK" -O check "$REMOTE" >/dev/null 2>&1; }
 
+ca_fingerprint() { openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2; }
+
+# ดึง CA ของ PentAGI จาก kalla มาไว้ที่ $CA (ไม่อยู่ใน git เพราะเปลี่ยนทุกครั้งที่ติดตั้งใหม่)
+# คืนค่า 0 เมื่อได้ CA ที่ถูกต้อง; ตั้ง CA_CHANGED=1 เมื่อไฟล์ใหม่ต่างจากของเดิม
+fetch_ca() {
+  local tmp new old=""
+  CA_CHANGED=0
+  tmp="$(mktemp)"
+  if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" \
+      'docker exec pentagi cat /opt/pentagi/ssl/service_ca.crt' >"$tmp" 2>/dev/null \
+      || ! openssl x509 -in "$tmp" -noout 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  new="$(ca_fingerprint "$tmp")"
+  [[ -f "$CA" ]] && old="$(ca_fingerprint "$CA")"
+  if [[ "$new" != "$old" ]]; then
+    mv "$tmp" "$CA"
+    chmod 644 "$CA"
+    CA_CHANGED=1
+  else
+    rm -f "$tmp"
+  fi
+}
+
+print_ca_install_hint() {
+  echo "sha256: $(ca_fingerprint "$CA")"
+  echo "นำเข้า Chromium (ลบของเก่าก่อนถ้ามี แล้วปิด/เปิด Chromium ใหม่):"
+  echo "  certutil -d sql:\$HOME/.pki/nssdb -D -n \"PentAGI CA\""
+  echo "  certutil -d sql:\$HOME/.pki/nssdb -A -t \"C,,\" -n \"PentAGI CA\" -i $CA"
+}
+
+ca() {
+  if ! fetch_ca; then
+    echo "ดึง CA จาก kalla ไม่ได้ (pentagi รันอยู่หรือไม่? ลอง ./penhub-kalla start)" >&2
+    exit 1
+  fi
+  if [[ "$CA_CHANGED" == 1 ]]; then echo "อัปเดตไฟล์ CA: $CA"; else echo "CA ล่าสุดอยู่แล้ว: $CA"; fi
+  print_ca_install_hint
+}
+
 start() {
   if ! grep -qE "^127\.0\.0\.1[[:space:]]+${NAME}\b" /etc/hosts; then
     echo "ไม่พบ ${NAME} ใน /etc/hosts ให้รันก่อน:" >&2
     echo "  echo '127.0.0.1 ${NAME}' | sudo tee -a /etc/hosts" >&2
     exit 1
   fi
-  if [[ ! -f "$CA" ]]; then
-    echo "ไม่พบไฟล์ CA: $CA" >&2
-    exit 1
-  fi
 
   echo "==> สตาร์ตบริการบน kalla"
   compose up -d
+
+  echo "==> CA"
+  local got=0
+  for _ in $(seq 1 30); do
+    if fetch_ca; then got=1; break; fi
+    sleep 1
+  done
+  if [[ "$got" != 1 ]]; then
+    echo "ดึง CA จาก kalla ไม่ได้ภายใน 30 วินาที ลองดู log: ssh ${REMOTE} 'docker logs --tail 50 pentagi'" >&2
+    exit 1
+  fi
+  if [[ "$CA_CHANGED" == 1 ]]; then
+    echo "CA ใหม่หรือเปลี่ยนไปจากเดิม ต้อง import เข้า browser ใหม่:"
+    print_ca_install_hint
+  else
+    echo "CA ตรงกับที่มีอยู่"
+  fi
 
   echo "==> SSH tunnel พอร์ต ${PORT}"
   if tunnel_open; then
@@ -103,7 +158,11 @@ status() {
   fi
 
   echo "==> เว็บ ${URL}"
-  local code
+  local code=""
+  if [[ ! -f "$CA" ]]; then
+    echo "ไม่มีไฟล์ CA ให้รัน ./penhub-kalla ca ก่อน"
+    return 1
+  fi
   code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' --cacert "$CA" "$URL" || true)"
   if [[ "$code" == "200" ]]; then
     echo "ตอบ HTTP 200 พร้อมใช้งาน"
@@ -119,8 +178,9 @@ case "${1:-}" in
   start)  start ;;
   stop)   stop ;;
   status) status ;;
+  ca)     ca ;;
   *)
-    echo "usage: $(basename "$0") {start|stop|status}" >&2
+    echo "usage: $(basename "$0") {start|stop|status|ca}" >&2
     exit 2
     ;;
 esac
