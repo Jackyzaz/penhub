@@ -1,0 +1,9 @@
+# secrets และข้อมูลที่ไม่ควรเข้า repo
+.env
+.env.*
+!.env.example
+src/.env
+src/.env.*
+src/data/
+src/docker-ssl/
+src/ollama-data/
