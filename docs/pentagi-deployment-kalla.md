@@ -63,3 +63,26 @@ docker compose -p penhub-pentagi \
   -f docker-compose.yml \
   -f docker-compose.local-llm.yml ps
 ```
+
+## Flow สำหรับวิเคราะห์โจทย์ CTF (`penhub-ctf`)
+
+สร้าง Flow ผ่าน GraphQL API `createFlow(modelProvider, input)` ของ PentAGI (ตาม README ทางการ ตรวจเมื่อ 2026-10-06) โดยเติมโจทย์ลงแม่แบบ `ctf/prompt-template.md`
+
+ขั้นตอน:
+1. `./penhub-kalla start` ให้ tunnel และเว็บพร้อม
+2. สร้าง API token ที่ Settings -> API Tokens (แสดงครั้งเดียว) บันทึกลง `~/.config/penhub/pentagi-token` แล้ว `chmod 600` (อยู่นอก repo)
+3. ดู prompt ก่อนส่งจริงด้วย `--dry-run`, แล้วสร้าง Flow:
+
+```sh
+./penhub-ctf new --name "ชื่อโจทย์" --category crypto --desc-file โจทย์.txt --attach chall.py --dry-run
+./penhub-ctf new --name "ชื่อโจทย์" --category web --desc-file โจทย์.txt --target http://lab-host:8080
+./penhub-ctf list
+```
+
+ข้อควรรู้:
+- ไม่ใส่ `--target` = วิเคราะห์ offline จากข้อความ/ไฟล์ที่แนบเท่านั้น; ใส่ `--target` เฉพาะ host ของการแข่ง/lab ที่อนุญาตให้ทดสอบ
+- ไฟล์แนบถูกฝังใน prompt (จำกัดไฟล์ข้อความไม่เกิน 20 KB) ไม่ใช่การอัปโหลดไฟล์เข้า container
+- scope ใน prompt เป็นคำสั่งแก่ agent ไม่ใช่ network enforcement
+- ชื่อ provider เริ่มต้นคือ `ollama` (ตั้งทับด้วย `--provider` หรือ `PENTAGI_PROVIDER`) ยังไม่ได้ยืนยันกับ instance นี้ ดูชื่อที่ถูกต้องในหน้าเลือก provider ของ UI
+- ยังไม่ได้ทดสอบเรียก API จริง (ยังไม่มี token) ทดสอบแล้วเฉพาะ `--dry-run`
+- `llama3.1:8b` ขนาดเล็ก อาจวางแผน/เรียกเครื่องมือได้ไม่ดีกับโจทย์ยาก

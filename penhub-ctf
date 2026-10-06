@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# สร้าง Flow ใน PentAGI เพื่อวิเคราะห์โจทย์ CTF ผ่าน GraphQL API
+#   ./penhub-ctf new --name NAME --desc-file FILE [--category web] [--target URL]
+#                    [--attach FILE ...] [--provider NAME] [--dry-run]
+#   ./penhub-ctf list     แสดง Flow ล่าสุด (REST)
+# ต้องมี SSH tunnel ที่เปิดด้วย ./penhub-kalla start และ API token
+# token: สร้างที่ Settings -> API Tokens ในเว็บ แล้วเก็บใน $PENTAGI_TOKEN_FILE
+#   (ค่าเริ่มต้น ~/.config/penhub/pentagi-token, ต้อง chmod 600) หรือตั้ง PENTAGI_TOKEN
+# ไม่ใส่ --target = วิเคราะห์ offline จากไฟล์/ข้อความโจทย์เท่านั้น
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CA="$ROOT/pentagi-service-ca.crt"
+API="https://pentagi.local:8443/api/v1"
+TEMPLATE="$ROOT/ctf/prompt-template.md"
+TOKEN_FILE="${PENTAGI_TOKEN_FILE:-$HOME/.config/penhub/pentagi-token}"
+PROVIDER="${PENTAGI_PROVIDER:-ollama}"
+MAX_ATTACH_BYTES=20000
+
+die() { echo "$*" >&2; exit 1; }
+
+load_token() {
+  if [[ -n "${PENTAGI_TOKEN:-}" ]]; then TOKEN="$PENTAGI_TOKEN"; return; fi
+  [[ -f "$TOKEN_FILE" ]] || die "ไม่พบ token: สร้างที่ Settings -> API Tokens แล้วบันทึกลง $TOKEN_FILE (chmod 600)"
+  [[ "$(stat -c %a "$TOKEN_FILE")" == 600 ]] || die "$TOKEN_FILE ต้องมี permission 600"
+  TOKEN="$(<"$TOKEN_FILE")"
+}
+
+api() { # api METHOD PATH [curl args...]
+  local method="$1" path="$2"; shift 2
+  curl -sS --fail-with-body --cacert "$CA" -X "$method" \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    "$API$path" "$@"
+}
+
+new() {
+  local name="" desc_file="" category="unknown" target="" dry=0
+  local -a attach=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      --desc-file) desc_file="$2"; shift 2 ;;
+      --category) category="$2"; shift 2 ;;
+      --target) target="$2"; shift 2 ;;
+      --attach) attach+=("$2"); shift 2 ;;
+      --provider) PROVIDER="$2"; shift 2 ;;
+      --dry-run) dry=1; shift ;;
+      *) die "ไม่รู้จักตัวเลือก: $1" ;;
+    esac
+  done
+  [[ -n "$name" && -n "$desc_file" ]] || die "ต้องมี --name และ --desc-file"
+  [[ -f "$desc_file" ]] || die "ไม่พบไฟล์: $desc_file"
+
+  local scope attachments=""
+  if [[ -n "$target" ]]; then
+    scope="Allowed target (the only live host you may interact with): ${target}
+Everything else is out of scope."
+  else
+    scope="No live target. Analyze only the description and attached material in this prompt; do not make network connections to challenge or third-party hosts."
+  fi
+
+  local f
+  for f in "${attach[@]}"; do
+    [[ -f "$f" ]] || die "ไม่พบไฟล์แนบ: $f"
+    [[ "$(stat -c %s "$f")" -le "$MAX_ATTACH_BYTES" ]] || die "ไฟล์แนบใหญ่เกิน $MAX_ATTACH_BYTES bytes (ใช้แนบเฉพาะไฟล์ข้อความ/โค้ดขนาดเล็ก): $f"
+    grep -Iq . "$f" || die "ไฟล์แนบต้องเป็นข้อความ: $f"
+    attachments+="### Attachment: $(basename "$f")
+\`\`\`
+$(<"$f")
+\`\`\`
+
+"
+  done
+
+  local prompt
+  prompt="$(jq -Rrs --arg name "$name" --arg cat "$category" --arg desc "$(<"$desc_file")" \
+    --arg scope "$scope" --arg att "$attachments" '
+      split("{{NAME}}") | join($name) | split("{{CATEGORY}}") | join($cat)
+      | split("{{SCOPE}}") | join($scope) | split("{{ATTACHMENTS}}") | join($att)
+      | split("{{DESCRIPTION}}") | join($desc)' "$TEMPLATE")"
+
+  if [[ "$dry" == 1 ]]; then
+    echo "provider: $PROVIDER"; echo "----"; echo "$prompt"; return
+  fi
+
+  load_token
+  local body resp
+  body="$(jq -n --arg p "$PROVIDER" --arg i "$prompt" '{
+    query: "mutation($p: String!, $i: String!) { createFlow(modelProvider: $p, input: $i) { id title status } }",
+    variables: {p: $p, i: $i}}')"
+  resp="$(api POST /graphql -d "$body")" || { echo "$resp" >&2; exit 1; }
+  if jq -e '.errors' >/dev/null <<<"$resp"; then jq '.errors' <<<"$resp" >&2; exit 1; fi
+  jq -r '.data.createFlow | "สร้าง Flow #\(.id) สถานะ \(.status)\nเปิดดู: https://pentagi.local:8443/flows/\(.id)"' <<<"$resp"
+}
+
+list() { load_token; api GET /flows | jq .; }
+
+case "${1:-}" in
+  new) shift; new "$@" ;;
+  list) list ;;
+  *) sed -n '2,10p' "${BASH_SOURCE[0]}"; exit 1 ;;
+esac

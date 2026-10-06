@@ -15,6 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ./penhub-kalla stop     # ปิด tunnel ของสคริปต์ + docker compose stop (ไม่ใช่ down; ข้อมูลและโมเดลยังอยู่)
 ./penhub-kalla status   # compose ps + สถานะ tunnel + ตรวจเว็บ (exit 0 = พร้อมทั้งหมด)
 NO_BROWSER=1 ./penhub-kalla start   # ไม่เปิด browser
+./penhub-ctf new --name N --desc-file F [--target URL] [--dry-run]   # สร้าง Flow วิเคราะห์โจทย์ CTF ผ่าน API (ดู docs/pentagi-deployment-kalla.md)
 ```
 
 ## สถาปัตยกรรม (ต้องอ่านหลายที่ถึงจะเห็นภาพ)
