@@ -2,6 +2,7 @@
 # จัดการ PentAGI บน kalla
 #   ./penhub-kalla start   สตาร์ตบริการ + เปิด SSH tunnel + เปิด browser
 #   ./penhub-kalla stop    ปิด SSH tunnel + หยุดบริการบน kalla (ข้อมูลยังอยู่)
+#   ./penhub-kalla restart [service]  recreate บริการ (default pentagi) โหลด .env ใหม่ + รีเซ็ต tunnel + รอเว็บ
 #   ./penhub-kalla status  ดูสถานะบริการ, tunnel และเว็บ (exit 0 = พร้อมใช้งานทั้งหมด)
 #   ./penhub-kalla ca      ดึง CA ของ PentAGI จาก kalla (ไม่อยู่ใน git; start จะดึงให้เองด้วย)
 # ตั้ง NO_BROWSER=1 ถ้าไม่ต้องการให้ start เปิด browser
@@ -22,6 +23,45 @@ compose() {
 }
 
 tunnel_open() { ssh -S "$SOCK" -O check "$REMOTE" >/dev/null 2>&1; }
+
+# เปิด SSH tunnel ของสคริปต์ (ถ้ายังไม่มี) — ไม่แตะ tunnel ที่เปิดเอง
+open_tunnel() {
+  if tunnel_open; then
+    echo "tunnel ของสคริปต์เปิดอยู่แล้ว"
+  elif ss -ltn | grep -q "127.0.0.1:${PORT}\b"; then
+    echo "มีตัวฟังที่พอร์ต ${PORT} อยู่แล้ว (tunnel ที่เปิดเอง) ข้ามขั้นตอนนี้"
+  else
+    ssh -f -N -M -S "$SOCK" -o BatchMode=yes -o ExitOnForwardFailure=yes \
+      -L "${PORT}:127.0.0.1:${PORT}" "$REMOTE"
+    echo "เปิด tunnel ในพื้นหลังแล้ว"
+  fi
+}
+
+# ปิดแล้วเปิด tunnel ของสคริปต์ใหม่ (ใช้หลัง recreate container ที่ทำ tunnel ค้าง)
+reset_tunnel() {
+  if tunnel_open; then
+    ssh -S "$SOCK" -O exit "$REMOTE" >/dev/null 2>&1 || true
+    ssh -f -N -M -S "$SOCK" -o BatchMode=yes -o ExitOnForwardFailure=yes \
+      -L "${PORT}:127.0.0.1:${PORT}" "$REMOTE"
+    echo "รีเซ็ต tunnel ของสคริปต์แล้ว"
+  elif ss -ltn | grep -q "127.0.0.1:${PORT}\b"; then
+    echo "tunnel ที่เปิดเองยังอยู่ (ไม่แตะ) — ถ้าเว็บค้างให้ปิด/เปิดเอง"
+  else
+    open_tunnel
+  fi
+}
+
+# รอให้เว็บตอบ HTTP 200 (คืน 0 เมื่อพร้อม, 1 เมื่อครบ 60 วินาที)
+wait_web() {
+  local _
+  for _ in $(seq 1 60); do
+    if [[ "$(curl -s -o /dev/null -w '%{http_code}' --cacert "$CA" "$URL" || true)" == "200" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
 
 ca_fingerprint() { openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2; }
 
@@ -92,31 +132,20 @@ start() {
   fi
 
   echo "==> SSH tunnel พอร์ต ${PORT}"
-  if tunnel_open; then
-    echo "tunnel ของสคริปต์เปิดอยู่แล้ว"
-  elif ss -ltn | grep -q "127.0.0.1:${PORT}\b"; then
-    echo "มีตัวฟังที่พอร์ต ${PORT} อยู่แล้ว (tunnel ที่เปิดเอง) ข้ามขั้นตอนนี้"
-  else
-    ssh -f -N -M -S "$SOCK" -o BatchMode=yes -o ExitOnForwardFailure=yes \
-      -L "${PORT}:127.0.0.1:${PORT}" "$REMOTE"
-    echo "เปิด tunnel ในพื้นหลังแล้ว"
-  fi
+  open_tunnel
 
   echo "==> รอให้เว็บพร้อม"
-  for _ in $(seq 1 60); do
-    if [[ "$(curl -s -o /dev/null -w '%{http_code}' --cacert "$CA" "$URL" || true)" == "200" ]]; then
-      echo "พร้อมใช้งาน: $URL"
-      if [[ -z "${NO_BROWSER:-}" ]]; then
-        if command -v chromium >/dev/null; then
-          nohup chromium "$URL" >/dev/null 2>&1 &
-        else
-          xdg-open "$URL" >/dev/null 2>&1 &
-        fi
+  if wait_web; then
+    echo "พร้อมใช้งาน: $URL"
+    if [[ -z "${NO_BROWSER:-}" ]]; then
+      if command -v chromium >/dev/null; then
+        nohup chromium "$URL" >/dev/null 2>&1 &
+      else
+        xdg-open "$URL" >/dev/null 2>&1 &
       fi
-      return 0
     fi
-    sleep 1
-  done
+    return 0
+  fi
 
   echo "เว็บยังไม่ตอบ HTTP 200 ภายใน 60 วินาที ลองดู log: ssh ${REMOTE} 'docker logs --tail 50 pentagi'" >&2
   exit 1
@@ -136,6 +165,24 @@ stop() {
 
   echo "==> หยุดบริการบน kalla"
   compose stop
+}
+
+restart() {
+  local svc="${1:-pentagi}"
+  echo "==> recreate ${svc} บน kalla (โหลด .env/config ใหม่)"
+  compose up -d "$svc"
+
+  echo "==> SSH tunnel พอร์ต ${PORT}"
+  reset_tunnel
+
+  echo "==> รอให้เว็บพร้อม"
+  if wait_web; then
+    echo "พร้อมใช้งาน: $URL"
+    return 0
+  fi
+
+  echo "เว็บยังไม่ตอบ HTTP 200 ภายใน 60 วินาที ลองดู log: ssh ${REMOTE} 'docker logs --tail 50 pentagi'" >&2
+  exit 1
 }
 
 status() {
@@ -175,12 +222,13 @@ status() {
 }
 
 case "${1:-}" in
-  start)  start ;;
-  stop)   stop ;;
-  status) status ;;
-  ca)     ca ;;
+  start)   start ;;
+  stop)    stop ;;
+  restart) shift; restart "$@" ;;
+  status)  status ;;
+  ca)      ca ;;
   *)
-    echo "usage: $(basename "$0") {start|stop|status|ca}" >&2
+    echo "usage: $(basename "$0") {start|stop|restart|status|ca}" >&2
     exit 2
     ;;
 esac
